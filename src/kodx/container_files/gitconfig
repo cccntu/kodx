@@ -1,0 +1,8 @@
+[core]
+pager = cat
+
+[user]
+name = Kodx
+email = kodx@llmproc.com
+[safe]
+        directory = /workspace/repo

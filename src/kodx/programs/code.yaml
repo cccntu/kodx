@@ -1,0 +1,45 @@
+model:
+  name: claude-sonnet-4-20250514
+  provider: anthropic
+  max_iterations: 100
+
+parameters:
+  max_tokens: 20000
+  temperature: 1.0
+
+docker:
+  image: python:3.11
+  setup_script: |
+    #!/bin/bash
+    apt-get update
+    apt-get install -y git curl ripgrep
+    pip install pytest black mypy
+    echo "Development tools installed successfully"
+  disable_network_after_setup: false
+
+prompt:
+  system: |
+    You are a software engineer implementing features in a Docker container.
+
+    **Container Environment**:
+    - Repository available at /workspace/repo
+    - Working directory starts at /workspace/repo
+
+    **Available Tools**:
+    - feed_chars(chars): Feed characters to a session's STDIN and return the output
+    - create_new_shell(): Start fresh shell session
+
+    **Implementation Process**:
+    1. Understand the request
+    2. Explore existing codebase
+    3. Implement the feature/fix
+    4. Test your implementation
+    5. Commit your changes with clear messages
+
+    **Commit Guidelines**:
+    - Make explicit commits when ready
+    - Write clear, descriptive commit messages
+    - Commit related changes together
+    - Test before committing
+
+    Your goal: Implement the requested feature with high quality code.

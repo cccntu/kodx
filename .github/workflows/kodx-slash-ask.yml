@@ -1,0 +1,260 @@
+# .github/workflows/kodx-slash-ask.yml
+#
+# This workflow answers questions posted in GitHub issues and PRs using Kodx and Claude.
+#
+# Required secrets:
+# - ANTHROPIC_API_KEY: API key for Claude
+# Note: Uses the default GITHUB_TOKEN provided by GitHub Actions (no additional token setup needed)
+#
+# How it works:
+# 1. Triggered when someone comments "/ask <query>" or "dev /ask <query>" on an issue or PR
+# 2. Posts an initial status comment indicating processing has started
+# 3. Extracts the query from the comment (supports multi-line queries)
+# 4. Gathers context based on whether it's an issue or PR
+# 5. Runs Kodx with Claude to answer the question in a Docker container
+# 6. Updates the initial status comment with the complete response
+#
+# Security:
+# - Only responds to comments from repository owners, members, and collaborators
+# - Uses GitHub token for posting/updating comments
+# - Isolated container execution for security (api keys is isolated, outside the docker container)
+#
+# Query format:
+# - Single line: /ask What is the purpose of this file?
+# - Multi-line:
+#   /ask Can you explain how this works?
+#   Please include details about the implementation.
+#
+# Development mode (uses Kodx from source):
+# - dev /ask What is the purpose of this file?
+
+name: Kodx /ask
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  answer:
+    runs-on: ubuntu-latest
+
+    # Only run when comment starts with "/ask" or "dev /ask" and is from a trusted user
+    if: >
+      (startsWith(github.event.comment.body, '/ask') ||
+       startsWith(github.event.comment.body, 'dev /ask')) &&
+      (github.event.comment.author_association == 'OWNER' ||
+       github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'COLLABORATOR')
+
+    steps:
+      # -- 1. Extract command and context using github-script --------------
+      - name: Extract command and context
+        id: extract
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = context.payload.comment.body;
+            const issue = context.payload.issue;
+
+            // Check if this is dev mode
+            const isDev = comment.startsWith('dev /ask');
+
+            // Extract query after /ask or dev /ask
+            const pattern = isDev ? /dev \/ask\s+([\s\S]*)/ : /\/ask\s+([\s\S]*)/;
+            const match = comment.match(pattern);
+
+            if (!match || !match[1]) {
+              core.setFailed('Could not extract query from comment');
+              return;
+            }
+
+            const query = match[1].trim();
+
+            // Set outputs
+            core.setOutput('is_dev', isDev);
+            core.setOutput('query', query);
+            core.setOutput('issue_number', issue.number);
+            core.setOutput('issue_title', issue.title);
+            core.setOutput('issue_body', issue.body || '(No description provided)');
+            core.setOutput('is_pr', !!issue.pull_request);
+
+            // Log for debugging
+            console.log('Extracted query:', query);
+            console.log('Is PR:', !!issue.pull_request);
+            console.log('Is dev mode:', isDev);
+
+      # -- 2. Create initial status comment --------------------------------
+      - name: Create status comment
+        id: status_comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            const { data: comment } = await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: ${{ steps.extract.outputs.issue_number }},
+              body: `🤔 **Processing your question with Kodx...** — [View logs](${runUrl})`
+            });
+
+            core.setOutput('comment_id', comment.id);
+
+      # -- 3. Get PR details if applicable --------------------------------
+      - name: Get PR details
+        id: pr_details
+        if: steps.extract.outputs.is_pr == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: ${{ steps.extract.outputs.issue_number }}
+              });
+
+              core.setOutput('base_branch', pr.base.ref);
+              core.setOutput('head_branch', pr.head.ref);
+              console.log(`PR branches: ${pr.head.ref} -> ${pr.base.ref}`);
+            } catch (error) {
+              console.log('Failed to get PR details:', error.message);
+              core.setOutput('base_branch', '');
+              core.setOutput('head_branch', '');
+            }
+
+      # -- 4. Checkout repository ------------------------------------------
+      - uses: actions/checkout@v4
+
+      # -- 5. Setup Python and Kodx -----------------------------------
+      - name: Setup Python and dependencies
+        run: |
+          python -m pip install uv
+          if [ "${{ steps.extract.outputs.is_dev }}" = "true" ]; then
+            uv venv
+            source .venv/bin/activate
+            uv sync --all-extras
+          fi
+
+      # -- 6. Create prompt file -------------------------------------------
+      - name: Create prompt file
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            const query = ${{ toJSON(steps.extract.outputs.query) }};
+            const title = ${{ toJSON(steps.extract.outputs.issue_title) }};
+            const body = ${{ toJSON(steps.extract.outputs.issue_body) }};
+            const isPR = ${{ steps.extract.outputs.is_pr }};
+
+            let prompt;
+            if (isPR) {
+              const baseBranch = ${{ toJSON(steps.pr_details.outputs.base_branch) }};
+              const headBranch = ${{ toJSON(steps.pr_details.outputs.head_branch) }};
+
+              prompt = "I'm in a pull request titled: " + title + "\n\n" +
+                      "PR Description:\n" + body + "\n\n" +
+                      "Source branch: " + headBranch + "\n" +
+                      "Target branch: " + baseBranch + "\n\n" +
+                      "Question: " + query;
+            } else {
+              prompt = "I'm in an issue titled: " + title + "\n\n" +
+                      "Issue Description:\n" + body + "\n\n" +
+                      "Question: " + query;
+            }
+
+            fs.writeFileSync('prompt.txt', prompt);
+            console.log('Created prompt file');
+
+      # -- 7. Run Kodx to answer question -----------------------------
+      - name: Run Kodx
+        id: run_kodx
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ "${{ steps.extract.outputs.is_dev }}" = "true" ]; then
+            echo "Using Kodx from source"
+            source .venv/bin/activate
+            kodx .github/config/kodx-slash-ask-program.yaml \
+              --repo-dir . \
+              --prompt-file prompt.txt \
+              --cost-limit 1.0 \
+              --json-output-file kodx_result.json
+          else
+            echo "Using Kodx from PyPI"
+            uvx kodx .github/config/kodx-slash-ask-program.yaml \
+              --repo-dir . \
+              --prompt-file prompt.txt \
+              --cost-limit 1.0 \
+              --json-output-file kodx_result.json
+          fi
+
+          # Validate JSON output
+          if ! python -m json.tool kodx_result.json > /dev/null 2>&1; then
+            echo "Invalid JSON output from Kodx"
+            exit 1
+          fi
+
+      # -- 8. Update status comment with answer ----------------------------
+      - name: Update status comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            let body;
+            const outcome = '${{ steps.run_kodx.outcome }}';
+
+            if (outcome === 'success') {
+              try {
+                // Read and parse Kodx output
+                const output = JSON.parse(fs.readFileSync('kodx_result.json', 'utf8'));
+                const response = output.last_message || 'No response generated';
+                const costInfo = typeof output.usd_cost !== 'undefined'
+                  ? ` (cost: $${output.usd_cost.toFixed(4)})`
+                  : '';
+
+                // Format stderr as work log
+                const workLog = output.stderr && output.stderr.length > 0
+                  ? output.stderr.map(line => `- ${line}`).join('\n')
+                  : null;
+
+                // Build response body
+                if (output.stop_reason === 'cost_limit_exceeded') {
+                  body = `⚠️ **Question partially answered (cost limit reached)**\n\n${response}`;
+                } else {
+                  body = `✅ **Question answered**\n\n${response}`;
+                }
+
+                if (workLog) {
+                  body += `\n\n<details>\n<summary>Work log</summary>\n\n${workLog}\n</details>`;
+                }
+
+                body += `\n\n[View run](${runUrl})${costInfo}`;
+              } catch (error) {
+                console.error('Error parsing Kodx output:', error);
+                body = `❌ **Failed to parse response** — [View logs](${runUrl})`;
+              }
+            } else {
+              body = `❌ **Failed to answer question** — [View logs](${runUrl})`;
+            }
+
+            // Update the comment
+            try {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: ${{ steps.status_comment.outputs.comment_id }},
+                body: body
+              });
+            } catch (error) {
+              console.error('Failed to update comment:', error);
+            }

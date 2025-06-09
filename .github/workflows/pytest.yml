@@ -1,0 +1,46 @@
+name: Python Tests
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+    types: [opened, synchronize, reopened]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        # Install uv
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        # Add uv to PATH
+        export PATH="${PATH}:${HOME}/.cargo/bin"
+        echo "${HOME}/.cargo/bin" >> $GITHUB_PATH
+        # Create virtual environment
+        uv venv
+        # Activate virtual environment
+        source .venv/bin/activate
+        # Install dependencies with uv (including all extras and dev tools)
+        uv sync --all-extras --group dev
+
+    - name: Run tests
+      env:
+        ANTHROPIC_API_KEY: sk-ant-mock-key-for-testing
+        OPENAI_API_KEY: sk-mock-key-for-testing
+        NO_COLOR: 1
+        FORCE_COLOR: 0
+        TERM: dumb
+      run: |
+        # Activate virtual environment
+        source .venv/bin/activate
+        # Run unit tests only (no Docker required)
+        make test

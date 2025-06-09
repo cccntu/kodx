@@ -1,0 +1,522 @@
+# .github/workflows/kodx-slash-code.yml
+#
+# This workflow implements code changes requested in GitHub issues or PRs using Kodx and Claude.
+#
+# Required secrets:
+# - ANTHROPIC_API_KEY: API key for Claude
+# - KODX_WRITE_TOKEN: GitHub personal access token with write permissions (contents, pull-requests)
+#
+# LIMITATION: This workflow cannot modify files under .github/workflows/ due to GitHub's
+# security restrictions. Even if your token has 'workflow' permission, GitHub Actions
+# prevents workflows from modifying workflow files as an additional security measure.
+#
+# How it works:
+# 1. Triggered when someone comments "/code <request>" or "dev /code <request>" on an issue or PR
+# 2. Posts an initial status comment indicating processing has started
+# 3. Creates a new feature branch from the base branch (main/master)
+# 4. Uses Kodx with Claude to implement the requested changes in a Docker container
+# 5. Exports changes from the container to the repository
+# 6. Commits the changes if any were made
+# 7. Creates a PR with the implemented changes if there are new commits
+# 8. Updates the status comment with the final result
+#
+# Comment behavior:
+# - Creates only ONE status comment per invocation (no duplicate comments)
+# - The initial "Processing..." comment is updated with the final result
+# - Includes implementation details and export logs
+#
+# Security:
+# - Only responds to comments from repository owners, members, and collaborators
+# - Uses GitHub token for authentication
+# - Isolated container execution with file export (api keys is isolated, outside the docker container)
+#
+# Request format:
+# - Single line: /code Add a new feature X
+# - Multi-line:
+#   /code Implement the following:
+#   - Add feature X
+#   - Update documentation
+# - Empty comment on an issue (not PR) uses the issue body as the request
+#
+# Development mode (uses Kodx from source):
+# - dev /code Add a new feature X
+
+name: Kodx /code
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  implement:
+    runs-on: ubuntu-latest
+
+    # Only run when:
+    # 1. Comment starts with "/code" or "dev /code"
+    # 2. Comment is from a trusted user
+    if: >
+      (startsWith(github.event.comment.body, '/code') ||
+       startsWith(github.event.comment.body, 'dev /code')) &&
+      (
+        github.event.comment.author_association == 'OWNER' ||
+        github.event.comment.author_association == 'MEMBER' ||
+        github.event.comment.author_association == 'COLLABORATOR'
+      )
+
+    steps:
+      # -- 1. Post initial status comment ----------------------------------
+      - name: Post initial status comment
+        id: start_comment
+        env:
+          GH_TOKEN: ${{ secrets.KODX_WRITE_TOKEN }}
+          ISSUE_NUM: ${{ github.event.issue.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          cid=$(gh api --method POST \
+                "/repos/${{ github.repository }}/issues/$ISSUE_NUM/comments" \
+                -f body="🔨 **Processing your code request with Kodx...** — [View logs]($RUN_URL)" \
+                --jq .id)
+          echo "id=$cid" >> $GITHUB_OUTPUT
+
+      # -- 2. Extract request from comment ---------------------------------
+      - name: Extract request
+        id: extract_request
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const comment = context.payload.comment.body;
+            const issue = context.payload.issue;
+
+            // Check if this is dev mode
+            const isDev = comment.startsWith('dev /code');
+
+            // Extract request after /code or dev /code
+            const pattern = isDev ? /dev \/code\s+([\s\S]*)/ : /\/code\s+([\s\S]*)/;
+            const match = comment.match(pattern);
+
+            let request = match && match[1] ? match[1].trim() : '';
+
+            if (!request) {
+              if (!issue.pull_request && issue.body && issue.body.trim()) {
+                request = issue.body.trim();
+              } else {
+                core.setFailed('Could not extract request from comment');
+                return;
+              }
+            }
+
+            // Set outputs
+            core.setOutput('is_dev', isDev);
+            core.setOutput('request', request);
+
+            // Log for debugging
+            console.log('Extracted request:', request);
+            console.log('Is dev mode:', isDev);
+
+      # -- 3. Get context details ------------------------------------------
+      - name: Get issue/PR context
+        id: context
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.KODX_WRITE_TOKEN }}
+          script: |
+            const issue = context.payload.issue;
+
+            // Check if this is a PR
+            if (issue.pull_request) {
+              core.setOutput('is_pr', 'true');
+
+              // Get PR details
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: issue.number
+              });
+
+              core.setOutput('base_branch', pr.base.ref);
+            } else {
+              core.setOutput('is_pr', 'false');
+
+              // For issues, use the default branch
+              const { data: repo } = await github.rest.repos.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo
+              });
+
+              core.setOutput('base_branch', repo.default_branch);
+            }
+
+            // Get title and body safely
+            core.setOutput('title', issue.title);
+            core.setOutput('body', issue.body || '(No description provided)');
+
+      # -- 4. Checkout and setup -------------------------------------------
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history for proper branching
+          ref: ${{ steps.context.outputs.base_branch }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Create feature branch
+        id: create_branch
+        run: |
+          # Create unique branch name
+          timestamp=$(date +%s)
+          branch_name="kodx-code-${timestamp}"
+
+          # Create and checkout new branch
+          git checkout -b "$branch_name"
+          echo "branch_name=$branch_name" >> $GITHUB_OUTPUT
+
+          # Record initial commit for comparison
+          echo "initial_commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      # -- 5. Setup Python and dependencies --------------------------------
+      - name: Setup Python and dependencies
+        run: |
+          python -m pip install uv
+          if [ "${{ steps.extract_request.outputs.is_dev }}" = "true" ]; then
+            uv venv
+            source .venv/bin/activate
+            uv sync --all-extras
+          fi
+
+      # -- 6. Create implementation prompt ----------------------------------
+      - name: Create implementation prompt
+        id: create_prompt
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            const request = ${{ toJSON(steps.extract_request.outputs.request) }};
+            const title = ${{ toJSON(steps.context.outputs.title) }};
+            const body = ${{ toJSON(steps.context.outputs.body) }};
+            const isPR = ${{ steps.context.outputs.is_pr }};
+
+            let prompt;
+            if (isPR === 'true') {
+              prompt = `Context: This request is from a pull request titled: ${title}\n\nPR Description:\n${body}\n\nImplementation Request:\n${request}`;
+            } else {
+              prompt = `Context: This request is from an issue titled: ${title}\n\nIssue Description:\n${body}\n\nImplementation Request:\n${request}`;
+            }
+
+            fs.writeFileSync('prompt.txt', prompt);
+            console.log('Created prompt file successfully');
+
+      # -- 7. Run Kodx to implement changes ---------------------------
+      - name: Run Kodx to implement changes
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Create export directory for changes
+          mkdir -p ./kodx-changes
+
+          # Check if dev mode was detected
+          # Note: setup script is now embedded in the kodx-slash-code-program.yaml file
+          # in the docker.setup_script field instead of being created here
+          if [ "${{ steps.extract_request.outputs.is_dev }}" = "true" ]; then
+            echo "Using Kodx from source"
+            source .venv/bin/activate
+            kodx .github/config/kodx-slash-code-program.yaml \
+              --repo-dir . \
+              --prompt-file prompt.txt \
+              --export-dir ./kodx-changes \
+              --cost-limit 2.0 \
+              --json-output-file kodx_result.json
+          else
+            echo "Using Kodx from PyPI"
+            uvx kodx .github/config/kodx-slash-code-program.yaml \
+              --repo-dir . \
+              --prompt-file prompt.txt \
+              --export-dir ./kodx-changes \
+              --cost-limit 2.0 \
+              --json-output-file kodx_result.json
+          fi
+
+      - name: Process implementation output
+        id: implement_step
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            try {
+              const output = JSON.parse(fs.readFileSync('kodx_result.json', 'utf8'));
+
+              // Extract last message safely
+              const lastMessage = output.last_message || 'No response generated';
+              core.setOutput('last_message', lastMessage);
+
+              // Extract and format stderr log as markdown bullets
+              const stderrLog = output.stderr && output.stderr.length > 0
+                ? output.stderr.map(line => `- ${line}`).join('\n')
+                : '';
+              core.setOutput('stderr_log', stderrLog);
+
+              // Export information
+              if (output.export) {
+                core.setOutput('export_info', JSON.stringify(output.export));
+              }
+
+              // Expose cost if provided
+              if (typeof output.usd_cost !== 'undefined') {
+                core.setOutput('usd_cost', output.usd_cost);
+              }
+
+              // Expose stop reason
+              if (output.stop_reason) {
+                core.setOutput('stop_reason', output.stop_reason);
+              }
+
+              core.setOutput('success', 'true');
+              console.log('Successfully processed implementation output');
+            } catch (error) {
+              console.error('Error processing implementation output:', error);
+              core.setOutput('last_message', 'Error: Failed to parse Kodx output');
+              core.setOutput('stderr_log', '');
+              core.setOutput('success', 'false');
+            }
+
+      # -- 8. Parse commits from export directory -------------------------
+      - name: Parse exported commits
+        id: check_commits
+        run: |
+          # Check if export directory contains a valid git repository
+          if ! git -C ./kodx-changes rev-parse HEAD >/dev/null 2>&1; then
+            echo "❌ No valid git repository found in export directory"
+
+            # Fallback: copy files and commit manually if they exist
+            if [ -d "./kodx-changes" ] && [ "$(ls -A ./kodx-changes 2>/dev/null)" ]; then
+              echo "Copying files without git history..."
+              cp -r ./kodx-changes/* .
+
+              if [ -n "$(git status --porcelain)" ]; then
+                echo "has_commits=true" >> $GITHUB_OUTPUT
+                echo "last_commit_message=feat: $(echo '${{ steps.extract_request.outputs.request }}' | head -n1 | cut -c1-50)" >> $GITHUB_OUTPUT
+
+                git add .
+                git commit -m "feat: $(echo '${{ steps.extract_request.outputs.request }}' | head -n1 | cut -c1-72)
+
+                Implemented via Kodx GitHub automation.
+
+                Original request: ${{ steps.extract_request.outputs.request }}
+
+                🤖 Generated with Kodx"
+              else
+                echo "has_commits=false" >> $GITHUB_OUTPUT
+              fi
+            else
+              echo "has_commits=false" >> $GITHUB_OUTPUT
+            fi
+            exit 0
+          fi
+
+          echo "✅ Found valid git repository in export directory"
+
+          # Validate export has commits
+          commit_count=$(git -C ./kodx-changes rev-list --count HEAD 2>/dev/null || echo "0")
+          if [ "$commit_count" -eq 0 ]; then
+            echo "❌ No commits found in export repository"
+            echo "has_commits=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "✅ Found $commit_count commits in export repository"
+
+          # Add export as remote and fetch
+          echo "Adding export repository as remote..."
+          git remote add export-repo ./kodx-changes 2>/dev/null || true
+          git fetch export-repo
+
+          # Create new branch from export HEAD
+          echo "Creating branch from export HEAD..."
+          timestamp=$(date +%s)
+          export_branch="kodx-export-${timestamp}"
+          git checkout -b "$export_branch" export-repo/HEAD
+
+          # Validate changes against correct base branch
+          base_branch="origin/${{ steps.context.outputs.base_branch }}"
+          echo "Comparing against base branch: $base_branch"
+
+          if git diff --quiet HEAD "$base_branch"; then
+            echo "❌ No changes found - export HEAD is same as base branch"
+            echo "has_commits=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Get commit info relative to correct base
+          new_commit_count=$(git rev-list --count "$base_branch"..HEAD 2>/dev/null || echo "0")
+          if [ "$new_commit_count" -eq 0 ]; then
+            echo "❌ No new commits relative to base branch"
+            echo "has_commits=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "✅ Found $new_commit_count new commits relative to base branch"
+
+          # Get commit details for PR
+          last_commit=$(git log -1 --format="%s" 2>/dev/null || echo "Kodx implementation")
+          commit_details=$(git log --oneline "$base_branch"..HEAD 2>/dev/null || echo "No commits found")
+
+          # Set outputs for PR creation
+          echo "has_commits=true" >> $GITHUB_OUTPUT
+          echo "last_commit_message=$last_commit" >> $GITHUB_OUTPUT
+          echo "commit_details<<EOF" >> $GITHUB_OUTPUT
+          echo "$commit_details" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "export_branch=$export_branch" >> $GITHUB_OUTPUT
+
+          echo "✅ Successfully parsed commits from export repository"
+
+      - name: Push branch and create PR
+        id: create_pr
+        if: steps.check_commits.outputs.has_commits == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.KODX_WRITE_TOKEN }}
+          script: |
+            const { execSync } = require('child_process');
+
+            // Use the export branch if available, otherwise fall back to original branch
+            const branchName = '${{ steps.check_commits.outputs.export_branch }}' || '${{ steps.create_branch.outputs.branch_name }}';
+
+            // Push the branch
+            execSync(`git push origin "${branchName}"`);
+
+            // Get the last commit message as PR title (from our stored output or git log)
+            let prTitle = '${{ steps.check_commits.outputs.last_commit_message }}';
+            if (!prTitle) {
+              prTitle = execSync('git log -1 --format=%s', { encoding: 'utf8' }).trim();
+            }
+
+            // Get implementation output safely
+            const implementationOutput = ${{ toJSON(steps.implement_step.outputs.last_message) }};
+            const stderrLog = ${{ toJSON(steps.implement_step.outputs.stderr_log) }};
+
+            // Build PR body
+            let body = `## Implementation Output\n\n${implementationOutput}\n\n`;
+
+            // Add commit details if available
+            const commitDetails = '${{ steps.check_commits.outputs.commit_details }}';
+            if (commitDetails && commitDetails.trim()) {
+              body += `## Commits Made\n\n\`\`\`\n${commitDetails}\n\`\`\`\n\n`;
+            }
+
+            // Add work log if present
+            if (stderrLog && stderrLog.trim()) {
+              body += `## Process Log\n\n<details>\n<summary>Work log entries</summary>\n\n${stderrLog}\n</details>\n\n`;
+            }
+
+            // Add reference to original issue/PR
+            body += `---\nRequested in #${{ github.event.issue.number }}\nAutomated by Kodx GitHub Action`;
+
+            // Create the PR
+            const { data: pr } = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: prTitle,
+              body: body,
+              base: '${{ steps.context.outputs.base_branch }}',
+              head: branchName
+            });
+
+            // Ensure kodx label exists, create if needed
+            try {
+              await github.rest.issues.getLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'kodx'
+              });
+            } catch (error) {
+              if (error.status === 404) {
+                console.log('Creating kodx label...');
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: 'kodx',
+                  description: 'PRs created by Kodx GitHub Actions workflows',
+                  color: '2ea44f'
+                });
+                console.log('Created kodx label');
+              }
+            }
+
+            // Add kodx label to the PR
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: ['kodx']
+              });
+              console.log('Added kodx label to PR');
+            } catch (error) {
+              console.log('Warning: Could not add kodx label:', error.message);
+            }
+
+            core.setOutput('pr_url', pr.html_url);
+            console.log(`Created PR: ${pr.html_url}`);
+
+      # -- 10. Update status comment ---------------------------------------
+      - name: Update status comment
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.KODX_WRITE_TOKEN }}
+          script: |
+            const commentId = '${{ steps.start_comment.outputs.id }}';
+
+            // Skip if we never created the start comment
+            if (!commentId) {
+              console.log('No comment ID found, skipping update');
+              return;
+            }
+
+            const runUrl = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}';
+            const implementSuccess = '${{ steps.implement_step.outputs.success }}';
+            const hasCommits = '${{ steps.check_commits.outputs.has_commits }}';
+            const prUrl = '${{ steps.create_pr.outputs.pr_url }}';
+            const usdCostRaw = '${{ steps.implement_step.outputs.usd_cost }}';
+            const cost = parseFloat(usdCostRaw);
+            const costInfo = !isNaN(cost) ? ` (cost: $${cost.toFixed(4)})` : '';
+            const stopReason = '${{ steps.implement_step.outputs.stop_reason }}';
+
+            let body;
+
+            // Determine the status message
+            if (implementSuccess !== 'true') {
+              body = `❌ **Failed to process code request** — [View logs](${runUrl})${costInfo}`;
+            } else if (stopReason === 'cost_limit_exceeded') {
+              body = `⚠️ **Code request stopped due to cost limit** — [View logs](${runUrl})${costInfo}`;
+            } else if (hasCommits === 'true' && prUrl) {
+              body = `✅ **Code implemented successfully with Kodx!** — [View PR](${prUrl}) | [View logs](${runUrl})${costInfo}`;
+            } else if (hasCommits !== 'true') {
+              // Get the full response to show why no changes were made
+              const response = ${{ toJSON(steps.implement_step.outputs.last_message) }};
+              body = `ℹ️ **No changes needed**\n\n${response}\n\n[View logs](${runUrl})${costInfo}`;
+            } else {
+              body = `⚠️ **Changes made but PR creation failed** — [View logs](${runUrl})${costInfo}`;
+            }
+
+            // Update the comment
+            try {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: commentId,
+                body: body
+              });
+              console.log('Successfully updated status comment');
+            } catch (error) {
+              console.error('Failed to update comment:', error);
+            }
