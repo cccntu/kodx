@@ -1,5 +1,9 @@
 <h1 align="center">Kodx</h1>
 <p align="center">Codex-inspired background agent that runs on your machine</p>
+<p align="center"><a href="https://doi.org/10.5281/zenodo.15633137"><img src="https://zenodo.org/badge/998953377.svg" alt="DOI"></a></p>
+
+
+
 
 
 ![Kodx Architecture Diagram](design-diagram.svg "Kodx architecture showing Docker container isolation with PTY server communication")
